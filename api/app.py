@@ -30,6 +30,43 @@ class EstimateClogResponse(BaseModel):
     hp_max_current: float
     percent_clogged: float
 
+from api.calculations import _predict_restriction_from_hp
+
+class PredictCleanRestrictionRequest(BaseModel):
+    asset_type: str = Field(..., description="Asset type identifier")
+    horsepower: float = Field(..., gt=0, description="Hydraulic horsepower")
+
+    @validator("asset_type")
+    def asset_type_not_empty(cls, v):
+        if not v or not str(v).strip():
+            raise ValueError("asset_type must be a non-empty string")
+        return v
+
+class PredictCleanRestrictionResponse(BaseModel):
+    predicted_restriction: float
+
+@app.post("/predict_clean_restriction", response_model=PredictCleanRestrictionResponse)
+def predict_clean_restriction(data: PredictCleanRestrictionRequest):
+    asset_type = str(data.asset_type)
+    if asset_type not in _all_models:
+        raise HTTPException(status_code=400, detail=f"Asset type '{asset_type}' not found in models.")
+    if asset_type not in _limits.index:
+        raise HTTPException(status_code=400, detail=f"Asset type '{asset_type}' not found in limits.")
+
+    max_hp = float(_limits.loc[asset_type, "Max_Horsepower"])
+    if not (0 < data.horsepower <= max_hp):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Horsepower must be between 0 and {max_hp} for asset type '{asset_type}'."
+        )
+
+    try:
+        restriction = _predict_restriction_from_hp(asset_type, data.horsepower)
+        return PredictCleanRestrictionResponse(predicted_restriction=round(float(restriction), 4))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception:
+        raise HTTPException(status_code=500, detail="Internal server error")
 @app.post("/estimate_clog", response_model=EstimateClogResponse)
 def estimate_clog(data: EstimateClogRequest):
     asset_type = str(data.asset_type)
