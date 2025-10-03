@@ -1,6 +1,6 @@
 test-scripts/
 Notebook/api/
-
+mlruns/
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
