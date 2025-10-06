@@ -21,11 +21,50 @@ import matplotlib.pyplot as plt
 import os
 import csv
 
+
+# ============================================================================
+# PRESENTATION POINT 1: CONFIGURATION & DATA HANDLING
+# ============================================================================
+# Talk about: Scalable data processing for large datasets
+# - Chunked reading prevents memory overflow with millions of records
+# - Asset-specific processing allows parallel deployment
+# - Configurable binning adapts to different equipment types
+# ============================================================================
+
 DATA_PATH = "data/air_filter_data.csv"
 LIMITS_PATH = "data/asset_limits.csv"
-CHUNKSIZE = 100_000
+CHUNKSIZE = 100_000 # Process data in manageable chunks
 HP_BIN_WIDTH = 50  # Bin width for HP (adjust based on your data density)
 PERCENTILE = 5  # Lower envelope
+
+
+# ============================================================================
+# PRESENTATION POINT 2: WHY 5TH PERCENTILE?
+# ============================================================================
+# APPROACH BENEFIT:
+# - The 5th percentile captures the "clean filter" baseline by focusing on
+#   the lower envelope of restriction values at each HP level
+# - Automatically filters out dirty filter readings without manual labeling
+# - Robust to outliers and sensor noise
+#
+# TRADE-OFFS vs OTHER APPROACHES:
+# 
+# Alternative 1: Minimum values per bin
+#   ❌ Too sensitive to sensor errors and anomalous low readings
+#   ❌ Can produce unrealistic baseline (lower than physically possible)
+#   ✅ Our 5th percentile is more stable and realistic
+#
+# Alternative 2: Mean/Median values
+#   ❌ Includes dirty filter data, overestimates clean baseline
+#   ❌ Not suitable for detecting degradation (no separation from dirty state)
+#   ✅ Our approach provides true lower envelope for anomaly detection
+#
+# Alternative 3: Manual labeling of clean states
+#   ❌ Requires expensive human annotation
+#   ❌ Not scalable across hundreds of assets
+#   ❌ Subjective and inconsistent
+#   ✅ Our automated approach is scalable and objective
+# ============================================================================
 
 # Step 1: Load asset limits
 limits_df = pd.read_csv(LIMITS_PATH)
@@ -56,6 +95,16 @@ print(f"Unique asset IDs in air_filter_data.csv: {sorted(all_data_asset_ids)}")
 print(f"Unique asset IDs in asset_limits.csv: {sorted(asset_limits.keys())}")
 asset_ids = sorted([aid for aid in asset_ids if aid in asset_limits])
 print(f"Intersection asset IDs to process: {asset_ids}")
+
+# ============================================================================
+# PRESENTATION POINT 3: ASSET-SPECIFIC MODELING
+# ============================================================================
+# Talk about: Why individual models per asset?
+# - Different equipment types have different HP-Restriction relationships
+# - Accounts for equipment-specific tolerances and operating ranges
+# - Enables targeted maintenance scheduling per asset
+# - Allows model updates without affecting other assets
+# ============================================================================
 
 # Step 3: Process each asset
 for asset_id in asset_ids:
@@ -96,6 +145,21 @@ for asset_id in asset_ids:
         print(f"Restriction range: {np.min(restriction):.2f} to {np.max(restriction):.2f}")
         print(f"Asset HP limit: {max_hp_asset} (from asset_limits.csv)")
         print(f"Asset Restriction limit: {max_restriction_asset} (from asset_limits.csv)")
+
+        # ============================================================================
+        # PRESENTATION POINT 4: BINNING STRATEGY
+        # ====================================================================
+        # Talk about: Why bin the data?
+        # - Reduces noise by aggregating measurements at similar HP levels
+        # - Makes percentile calculation more stable and meaningful
+        # - Converts irregular time-series data into structured HP-R pairs
+        # - Enables efficient model fitting (fewer points, same information)
+        #
+        # TRADE-OFFS:
+        # - Bin width too small: overfitting to noise
+        # - Bin width too large: loss of important detail
+        # - Current 50 HP bins balance smoothness vs detail
+        # ====================================================================
 
         # Step 4: Bin HydraulicHorsepower and compute 5th percentile Restriction per bin
         hp_min, hp_max = np.min(hp), np.max(hp)
@@ -138,6 +202,46 @@ for asset_id in asset_ids:
                 writer.writerow([center, val])
         mlflow.log_artifact(bins_csv_path)
 
+
+        # ====================================================================
+        # PRESENTATION POINT 5: ISOTONIC REGRESSION - THE CORE ALGORITHM
+        # ====================================================================
+        # Talk about: Why Isotonic Regression?
+        #
+        # APPROACH BENEFITS:
+        # ✅ Enforces monotonicity: R must increase with HP (physical constraint)
+        # ✅ Non-parametric: no assumption about functional form (linear, poly, etc)
+        # ✅ Flexible: follows data closely while respecting physics
+        # ✅ Robust: handles irregular spacing and varying data density
+        #
+        # TRADE-OFFS vs OTHER APPROACHES:
+        #
+        # Alternative 1: Linear Regression
+        #   ❌ Too rigid - real relationship is often non-linear
+        #   ❌ Cannot enforce monotonicity
+        #   ❌ Poor fit at low/high HP extremes
+        #   ✅ Our isotonic approach captures non-linear behavior
+        #
+        # Alternative 2: Polynomial Regression
+        #   ❌ Can produce non-monotonic curves (unrealistic)
+        #   ❌ Overfits with high degrees, underfits with low degrees
+        #   ❌ Unstable extrapolation
+        #   ✅ Our approach guarantees physical validity (always increasing)
+        #
+        # Alternative 3: Spline Fitting
+        #   ❌ Complex hyperparameter tuning (knot placement)
+        #   ❌ Can violate monotonicity without constraints
+        #   ❌ More complex to implement and maintain
+        #   ✅ Our isotonic approach is simpler and guarantees monotonicity
+        #
+        # Alternative 4: Neural Networks / Deep Learning
+        #   ❌ Overkill for 1D monotonic regression
+        #   ❌ Requires large training data and complex architecture
+        #   ❌ Black box - difficult to interpret and validate
+        #   ❌ Hard to enforce monotonicity constraints
+        #   ✅ Our approach is interpretable, explainable, and physics-based
+        # ====================================================================
+
         # Step 5: Fit Isotonic Regression (HP → Restriction, increasing)
         print("\nFitting Isotonic Regression (HP → Restriction)...")
         iso = IsotonicRegression(increasing=True, out_of_bounds="clip")
@@ -149,6 +253,28 @@ for asset_id in asset_ids:
         print(f"Isotonic model fitted:")
         print(f"  Input range (HP): {fit_bin_centers.min():.2f} to {fit_bin_centers.max():.2f}")
         print(f"  Output range (Restriction): {iso_pred.min():.2f} to {iso_pred.max():.2f}")
+
+
+        # ====================================================================
+        # PRESENTATION POINT 6: EXTRAPOLATION STRATEGY
+        # ====================================================================
+        # Talk about: The data sparsity problem
+        # - Clean filter data is rare at high HP (filters are usually dirty)
+        # - Need predictions across full operating range for anomaly detection
+        # - Can't wait years to collect enough clean high-HP data
+        #
+        # APPROACH BENEFITS:
+        # ✅ Physics-informed: linear extrapolation is reasonable assumption
+        # ✅ Conservative: forces line to meet equipment limits
+        # ✅ Transparent: clearly indicates fitted vs extrapolated regions
+        # ✅ Practical: enables immediate deployment
+        #
+        # TRADE-OFFS:
+        # ⚠️ Assumption: linear relationship continues beyond observed data
+        # ⚠️ Uncertainty increases with extrapolation distance
+        # ✅ Mitigation: model can be updated as more data becomes available
+        # ✅ Mitigation: clearly flag extrapolated predictions to users
+        # ====================================================================
 
         # Step 6: Determine initial linear extrapolation parameters
         print("\nComputing initial linear extrapolation...")
@@ -178,6 +304,21 @@ for asset_id in asset_ids:
             extrapolation_slope, extrapolation_intercept = np.polyfit(X_extrap, y_extrap, 1)
             print(f"  Initial slope: {extrapolation_slope:.6f} Restriction per HP")
             print(f"  Initial intercept: {extrapolation_intercept:.6f}")
+
+
+        # ====================================================================
+        # PRESENTATION POINT 7: FORCED EXTRAPOLATION TO SYSTEM LIMITS
+        # ====================================================================
+        # Talk about: Ensuring full coverage
+        # - Natural extrapolation might not reach equipment limits
+        # - Need baseline predictions across entire operating envelope
+        # - Adjust slope to guarantee coverage while maintaining physics
+        #
+        # This is a KEY DIFFERENTIATOR of our approach:
+        # - Combines data-driven fitting with engineering constraints
+        # - Ensures model is immediately deployable for all operating conditions
+        # - Balances statistical learning with domain knowledge
+        # ====================================================================
 
         # Step 7: Force extrapolation to cover full range
         print("\nAdjusting extrapolation to cover full operating range...")
@@ -216,6 +357,18 @@ for asset_id in asset_ids:
                     predictions[i] = slope * hp_val + intercept
                 predictions[i] = min(predictions[i], max_restriction_limit)
             return predictions
+        
+
+        # ====================================================================
+        # PRESENTATION POINT 8: MODEL PERSISTENCE & DEPLOYMENT
+        # ====================================================================
+        # Talk about: Production-ready outputs
+        # - Serialized models for fast API serving
+        # - All extrapolation parameters saved for reproducibility
+        # - Metadata enables model versioning and monitoring
+        # - CSV outputs for validation and auditing
+        # - Visualization for stakeholder communication
+        # ====================================================================
 
         # Step 9: Save model with extrapolation parameters
         model_data = {
@@ -241,6 +394,17 @@ for asset_id in asset_ids:
         print(f"Fitted Restriction range: {model_data['min_restriction_fitted']:.2f} to {model_data['max_restriction_fitted']:.2f}")
         print(f"Asset limits: HP={max_hp_asset}, Restriction={max_restriction_asset} (from asset_limits.csv)")
         print(f"Model coverage: HP up to {max_hp_asset}, Restriction up to {max_restriction_asset}")
+
+        # ====================================================================
+        # PRESENTATION POINT 9: VISUALIZATION FOR VALIDATION
+        # ====================================================================
+        # Talk about: Trust through transparency
+        # - Visual inspection catches edge cases and anomalies
+        # - Shows clear separation between fitted and extrapolated regions
+        # - Enables domain expert validation before deployment
+        # - Communicates model behavior to non-technical stakeholders
+        # ====================================================================
+
 
         # Step 10: Plot for visual inspection
         print("\nCreating visualization...")
@@ -298,6 +462,32 @@ for asset_id in asset_ids:
         print("since no clean baseline data exists in the high restriction range.")
 
 print("\nAll assets processed.")
+
+
+#============================================================================
+# PRESENTATION POINT 10: SUMMARY - KEY TAKEAWAYS
+# ============================================================================
+# Wrap up with:
+#
+# 1. SCALABILITY: Handles millions of records, hundreds of assets
+# 2. AUTOMATION: No manual labeling required
+# 3. PHYSICS-AWARE: Enforces monotonicity and respects equipment limits
+# 4. PRACTICAL: Works with sparse clean data via intelligent extrapolation
+# 5. TRANSPARENT: Visual validation and clear fitted/extrapolated regions
+# 6. PRODUCTION-READY: MLflow tracking, serialized models, API-ready
+#
+# BUSINESS VALUE:
+# - Enables predictive maintenance across entire fleet
+# - Reduces false alarms through accurate baseline modeling
+# - Prevents equipment damage by detecting filter issues early
+# - Scalable approach reduces engineering effort vs manual methods
+#
+# FUTURE ENHANCEMENTS:
+# - Continuous learning: update models as more clean data becomes available
+# - Uncertainty quantification: confidence intervals for extrapolated region
+# - Multi-variate models: incorporate temperature, humidity, altitude
+# - Transfer learning: share information across similar asset types
+# ============================================================================
 
 # Combine all asset model.pkl files into a single all_models.pkl
 import joblib
